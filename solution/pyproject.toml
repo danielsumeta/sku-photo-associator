@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sku-photo"
+version = "0.1.0"
+description = "SKU Photo Associator CLI"
+requires-python = ">=3.9"
+dependencies = ["Pillow>=10", "pytesseract>=0.3.10"]
+
+[project.scripts]
+sku-photo = "sku_photo.cli:main"
