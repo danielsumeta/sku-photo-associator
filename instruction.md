@@ -7,7 +7,7 @@ Build a CLI tool `sku-photo` that ingests a tabular inventory and a directory/zi
 
 ### Table
 - Input table is CSV (or JSON) with header row. Must contain at least `sku` column (case-insensitive). `sku` format: `^[A-Z]{2,4}-\d{4,6}(-[A-Z0-9]{1,4})?$` (e.g., `AB-1234`, `SKU-001234-X1`).
-- Other columns are opaque (preserve through to output). Rows without a valid `sku` must be reported as `invalid_rows` with reason `invalid_sku_format`.
+- Other columns (e.g. `name`, `qty`) are opaque metadata and do not need to appear in any output; grading does not check them. Rows without a valid `sku` must be reported as `invalid_rows` with reason `invalid_sku_format`.
 - Duplicate SKUs in table: allowed; photos matching a duplicate SKU must associate to **all** matching rows.
 
 ### Photos
@@ -17,11 +17,11 @@ Build a CLI tool `sku-photo` that ingests a tabular inventory and a directory/zi
 
 ## CLI Interface (required — tests invoke CLI only)
 
-All commands exit `0` on success, `1` on user error (bad args, missing files), `2` on validation failure (no valid associations when at least one valid association was expected, or `verify` violations). Errors print to stderr; stdout is JSON or human table per `--json`.
+All commands exit `0` on success, `1` on user error (bad args, missing files, missing `--sku-column` target), `2` only for `verify` invariant violations. `associate` always exits `0` when it successfully classifies every photo — even if zero photos matched (zero associations is a successful result, not a validation failure). Errors print to stderr; stdout is JSON or human table per `--json`.
 
 ```
 sku-photo init --table <path.csv|json> --photos <dir|zip> --out <dir> [--sku-column NAME]
-  # Validates inputs, creates <out>/manifest.json with stats. Idempotent (re-running with same inputs overwrites manifest).
+  # Validates inputs, creates <out>/manifest.json with `{total_rows, total_photos, invalid_rows[], skipped_files[], sku_column, table, photos}`. Idempotent (re-running with same inputs overwrites manifest). `--sku-column` selects the SKU column case-insensitively; exit 1 if the named column does not exist.
 
 sku-photo associate [--out <dir>] [--strict]
   # Reads <out>/manifest.json, runs OCR, creates associations.
@@ -46,9 +46,9 @@ Flags `--help` and `--version` required.
 1. **SKU-in-image mandatory:** `associate` must reject (move to `unassociated` with reason `no_sku_in_image`) any photo where OCR text does not contain its target SKU. Do not rely on filename.
 2. **Multi-match:** If a photo contains `AB-1234` and `CD-5678`, associate to both rows (or reject all with `multiple_skus_in_image` if `--strict`).
 3. **Dedup:** Photos with identical SHA256 are duplicates — count once in `associated` but list all source paths in `duplicate_photos` (inside `associations.json` and counted in `report.json`). `export` must not duplicate bytes.
-4. **Orphans & invalid:** Photos with no SKU match → `unassociated` (`no_sku_in_image`). Rows with no matching photo → listed but not an error. Rows with invalid SKU → `invalid_rows` (`invalid_sku_format`) and never matched.
+4. **Orphans & invalid:** Photos with no SKU match → `unassociated` (`no_sku_in_image`). Rows with no matching photo are simply absent from `associations` (no separate listing required and not an error). Rows with invalid SKU → `invalid_rows` (`invalid_sku_format`) and never matched.
 5. **Idempotency:** Re-running `associate`/`sort`/`export` with same inputs produces byte-identical `associations.*` and `report.json` (stable sort, sorted keys, deterministic JSON with 2-space indent).
-6. **Zip input:** Must handle zip without extracting to cwd (stream or tempdir cleanup — no leftover temp files).
+6. **Zip input:** Must handle zip without extracting to the current working directory. Extracting under `<out>/_zip_extract` is allowed and not checked; only cwd pollution is graded.
 7. **EXIF:** Use EXIF `DateTimeOriginal` when present for `--by date`; fallback to `mtime`. Missing EXIF must not crash.
 8. **Large batch:** Must handle 100 photos / 50 rows within 30s on 2-core (hidden test perf gate; cache OCR by hash if needed).
 

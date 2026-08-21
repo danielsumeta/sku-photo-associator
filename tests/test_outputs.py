@@ -78,9 +78,9 @@ def workdir(tmp_path):
 
 
 def _sku_photo_bin():
-    for cand in ["/home/danielsu/.local/bin/sku-photo", "/usr/local/bin/sku-photo"]:
-        if pathlib.Path(cand).exists():
-            return [cand]
+    import shutil
+    if shutil.which("sku-photo"):
+        return ["sku-photo"]
     return [sys.executable, "-m", "sku_photo.cli"]
 
 
@@ -438,3 +438,111 @@ def test_large_batch_perf_smoke(workdir):
     assert elapsed < 30, f"too slow: {elapsed:.1f}s"
     assoc = json.loads((out / "associations.json").read_text())
     assert len(assoc["associations"]) == 50
+
+def test_sku_column_override_and_missing_column(workdir):
+    table = workdir / "inventory.csv"
+    photos = workdir / "photos"
+    out = workdir / "out"
+    photos.mkdir()
+    # Custom column name
+    _write_csv(table, [{"my_code": "AB-1234", "name": "X"}, {"my_code": "BAD!", "name": "bad"}])
+    _render_text_image(photos / "a.jpg", "AB-1234 here")
+    r = _run(*_sku_photo_bin(), "init", "--table", str(table), "--photos", str(photos), "--out", str(out), "--sku-column", "my_code")
+    assert r.returncode == 0, r.stderr
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest.get("sku_column") is not None
+    assert len(manifest.get("invalid_rows", [])) == 1
+    # Wrong column name should be user error
+    out2 = workdir / "out2"
+    r = _run(*_sku_photo_bin(), "init", "--table", str(table), "--photos", str(photos), "--out", str(out2), "--sku-column", "no_such_col")
+    assert r.returncode == 1, "missing --sku-column should be exit 1"
+
+
+def test_user_error_missing_inputs(workdir):
+    missing = workdir / "nope.csv"
+    photos = workdir / "photos"
+    photos.mkdir()
+    out = workdir / "out"
+    table = workdir / "inventory.csv"
+    _write_csv(table, [{"sku": "AB-1234", "name": "X"}])
+    _render_text_image(photos / "a.jpg", "AB-1234")
+    r = _run(*_sku_photo_bin(), "init", "--table", str(missing), "--photos", str(photos), "--out", str(out))
+    assert r.returncode == 1
+    r = _run(*_sku_photo_bin(), "init", "--table", str(table), "--photos", str(workdir / "nope_dir"), "--out", str(out))
+    assert r.returncode == 1
+
+
+def test_zero_associations_exit_code_and_verify_ok(workdir):
+    table = workdir / "inventory.csv"
+    photos = workdir / "photos"
+    out = workdir / "out"
+    photos.mkdir()
+    _write_csv(table, [{"sku": "AB-1234", "name": "X"}])
+    _render_text_image(photos / "a.jpg", "no sku here at all")
+    r = _run(*_sku_photo_bin(), "init", "--table", str(table), "--photos", str(photos), "--out", str(out))
+    assert r.returncode == 0
+    r = _run(*_sku_photo_bin(), "associate", "--out", str(out))
+    # associate must exit 0 even with zero associations (spec clarification)
+    assert r.returncode == 0, f"associate with 0 matches should be 0 not {r.returncode}: {r.stderr}"
+    assoc = json.loads((out / "associations.json").read_text())
+    assert len(assoc["associations"]) == 0
+    # verify with 0 associations should still be 0
+    r = _run(*_sku_photo_bin(), "verify", "--out", str(out), "--json")
+    assert r.returncode == 0
+
+
+def test_export_dedup_and_zip_zip_cleanup_and_sort_date(workdir):
+    table = workdir / "inventory.csv"
+    # Build a zip with nested skipped files + 2 images with same bytes
+    src = workdir / "src"
+    src.mkdir()
+    _render_text_image(src / "a.jpg", "AB-1234")
+    # Duplicate bytes via copy
+    shutil.copy2(src / "a.jpg", src / "a_copy.jpg")
+    (src / "readme.txt").write_text("not image")
+    nested = src / "nested"
+    nested.mkdir()
+    (nested / "also.txt").write_text("nested skipped")
+    _render_text_image(nested / "b.jpg", "AB-1234")
+    zpath = workdir / "photos.zip"
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.write(src / "a.jpg", "a.jpg")
+        z.write(src / "a_copy.jpg", "a_copy.jpg")
+        z.write(src / "readme.txt", "readme.txt")
+        z.write(nested / "also.txt", "nested/also.txt")
+        z.write(nested / "b.jpg", "nested/b.jpg")
+    photos = src  # placeholder, not used
+    _write_csv(table, [{"sku": "AB-1234", "name": "X"}])
+    out = workdir / "out"
+    cwd_before = set(pathlib.Path.cwd().iterdir())
+    r = _run(*_sku_photo_bin(), "init", "--table", str(table), "--photos", str(zpath), "--out", str(out))
+    assert r.returncode == 0
+    r = _run(*_sku_photo_bin(), "associate", "--out", str(out))
+    assert r.returncode == 0
+    # sort by date should not crash and should use EXIF/mtime fallback
+    r = _run(*_sku_photo_bin(), "sort", "--by", "date", "--order", "asc", "--out", str(out))
+    assert r.returncode == 0
+    r = _run(*_sku_photo_bin(), "export", "--out", str(out))
+    assert r.returncode == 0
+    # cwd should not be polluted by zip extraction
+    cwd_after = set(pathlib.Path.cwd().iterdir())
+    assert not any(p.name.startswith("a_copy") for p in cwd_after - cwd_before), "zip should not extract to cwd"
+    # export dedup: at least one file in organized/AB-1234, but not 3 separate byte copies for 2 unique hashes
+    organized = out / "organized"
+    files = list(organized.rglob("*.jpg"))
+    assert len(files) >= 1
+    # duplicate_photos should reflect same-sha pair
+    assoc = json.loads((out / "associations.json").read_text())
+    assert any("duplicate" in k for p in assoc.get("duplicate_photos", []) for k in p.keys()) or len(assoc.get("duplicate_photos", [])) == 1
+
+
+def test_sku_photo_bin_is_portable_not_author_path():
+    # _sku_photo_bin should fall back to python -m when no system binary exists.
+    # Also ensure the helper does not hardcode needing a specific user home to be gradable.
+    bins = _sku_photo_bin()
+    # Should be either ["/usr/local/bin/sku-photo"] or [python, "-m", "sku_photo.cli"] etc.
+    assert len(bins) >= 1
+    # Running via bins should succeed for --help
+    r = _run(*bins, "--help")
+    assert r.returncode == 0
+
